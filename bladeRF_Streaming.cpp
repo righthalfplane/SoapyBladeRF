@@ -23,6 +23,7 @@
 #include <SoapySDR/Logger.hpp>
 #include <stdexcept>
 #include <iostream>
+#include <stdio.h>
 
 //cross platform usleep()
 #ifdef _MSC_VER
@@ -92,6 +93,8 @@ SoapySDR::Stream *bladeRF_SoapySDR::setupStream(
 {
     auto channels = channels_;
     if (channels.empty()) channels.push_back(0);
+    
+    printf("Simple setupStream\n");
 
     //check the channel configuration
     bladerf_channel_layout layout;
@@ -133,7 +136,7 @@ SoapySDR::Stream *bladeRF_SoapySDR::setupStream(
     int ret = bladerf_sync_config(
         _dev,
         layout,
-        BLADERF_FORMAT_SC16_Q11_META,
+        BLADERF_FORMAT_SC16_Q11,
         numBuffs,
         bufSize,
         numXfers,
@@ -223,11 +226,6 @@ int bladeRF_SoapySDR::activateStream(
 
     if (direction == SOAPY_SDR_RX)
     {
-        StreamMetadata cmd;
-        cmd.flags = flags;
-        cmd.timeNs = timeNs;
-        cmd.numElems = numElems;
-        _rxCmds.push(cmd);
     }
 
     if (direction == SOAPY_SDR_TX)
@@ -249,26 +247,10 @@ int bladeRF_SoapySDR::deactivateStream(
     if (direction == SOAPY_SDR_RX)
     {
         //clear all commands when deactivating
-        while (not _rxCmds.empty()) _rxCmds.pop();
     }
 
     if (direction == SOAPY_SDR_TX)
     {
-        //in a burst -> end it
-        if (_inTxBurst)
-        {
-            //initialize metadata
-            bladerf_metadata md;
-            md.timestamp = 0;
-            md.flags = BLADERF_META_FLAG_TX_BURST_END;
-            md.status = 0;
-
-            //send the tx samples
-            _txConvBuff[0] = 0;
-            _txConvBuff[1] = 0;
-            bladerf_sync_tx(_dev, _txConvBuff, 1, &md, 100/*ms*/);
-        }
-        _inTxBurst = false;
     }
 
     return 0;
@@ -285,56 +267,20 @@ int bladeRF_SoapySDR::readStream(
     //clip to the available conversion buffer size
     numElems = std::min(numElems, _rxBuffSize);
 
-    //extract the front-most command
-    //no command, this is a timeout...
-    if (_rxCmds.empty()) return SOAPY_SDR_TIMEOUT;
-    StreamMetadata &cmd = _rxCmds.front();
-
-    //clear output metadata
-    flags = 0;
-    timeNs = 0;
-
-    //return overflow status indicator
-    if (_rxOverflow)
-    {
-        _rxOverflow = false;
-        flags |= SOAPY_SDR_HAS_TIME;
-        timeNs = _rxTicksToTimeNs(_rxNextTicks);
-        return SOAPY_SDR_OVERFLOW;
-    }
-
-    //initialize metadata
-    bladerf_metadata md;
-    md.timestamp = 0;
-    md.flags = 0;
-    md.status = 0;
-
-    //without a soapy sdr time flag, set the blade rf now flag
-    if ((cmd.flags & SOAPY_SDR_HAS_TIME) == 0) md.flags |= BLADERF_META_FLAG_RX_NOW;
-    md.timestamp = _timeNsToRxTicks(cmd.timeNs);
-    if (cmd.numElems > 0) numElems = std::min(cmd.numElems, numElems);
-    cmd.flags = 0; //clear flags for subsequent calls
-
     //prepare buffers
     void *samples = (void *)buffs[0];
     if (_rxFloats or _rxChans.size() == 2) samples = _rxConvBuff;
 
     //recv the rx samples
     const long timeoutMs = std::max(_rxMinTimeoutMs, timeoutUs/1000);
-    int ret = bladerf_sync_rx(_dev, samples, numElems*_rxChans.size(), &md, timeoutMs);
+    int ret = bladerf_sync_rx(_dev, samples, numElems*_rxChans.size(), NULL, timeoutMs);
     if (ret == BLADERF_ERR_TIMEOUT) return SOAPY_SDR_TIMEOUT;
     if (ret == BLADERF_ERR_TIME_PAST) return SOAPY_SDR_TIME_ERROR;
     if (ret != 0)
     {
-        //any error when this is a finite burst causes the command to be removed
-        if (cmd.numElems > 0) _rxCmds.pop();
         SoapySDR::logf(SOAPY_SDR_ERROR, "bladerf_sync_rx() returned %s", _err2str(ret).c_str());
         return SOAPY_SDR_STREAM_ERROR;
     }
-
-    //actual count is number of samples in total all channels
-    numElems = md.actual_count / _rxChans.size();
-
     //perform the int16 to float conversion
     if (_rxFloats and _rxChans.size() == 1)
     {
@@ -369,25 +315,6 @@ int bladeRF_SoapySDR::readStream(
         }
     }
 
-    //unpack the metadata
-    flags |= SOAPY_SDR_HAS_TIME;
-    timeNs = _rxTicksToTimeNs(md.timestamp);
-
-    //parse the status
-    if ((md.status & BLADERF_META_STATUS_OVERRUN) != 0)
-    {
-        SoapySDR::log(SOAPY_SDR_SSI, "0");
-        _rxOverflow = true;
-    }
-
-    //consume from the command if this is a finite burst
-    if (cmd.numElems > 0)
-    {
-        cmd.numElems -= numElems;
-        if (cmd.numElems == 0) _rxCmds.pop();
-    }
-
-    _rxNextTicks = md.timestamp + numElems;
     return numElems;
 }
 
@@ -399,48 +326,8 @@ int bladeRF_SoapySDR::writeStream(
     const long long timeNs,
     const long timeoutUs)
 {
-    //clear EOB when the last sample will not be transmitted
-    if (numElems > _txBuffSize) flags &= ~(SOAPY_SDR_END_BURST);
-
     //clip to the available conversion buffer size
     numElems = std::min(numElems, _txBuffSize);
-
-    //initialize metadata
-    bladerf_metadata md;
-    md.timestamp = 0;
-    md.flags = 0;
-    md.status = 0;
-
-    //time and burst start
-    if (_inTxBurst)
-    {
-        if ((flags & SOAPY_SDR_HAS_TIME) != 0)
-        {
-            md.timestamp = _timeNsToTxTicks(timeNs);
-            md.flags |= BLADERF_META_FLAG_TX_UPDATE_TIMESTAMP;
-            _txNextTicks = md.timestamp;
-        }
-    }
-    else
-    {
-        md.flags |= BLADERF_META_FLAG_TX_BURST_START;
-        if ((flags & SOAPY_SDR_HAS_TIME) != 0)
-        {
-            md.timestamp = _timeNsToTxTicks(timeNs);
-        }
-        else
-        {
-            md.flags |= BLADERF_META_FLAG_TX_NOW;
-            bladerf_get_timestamp(_dev, BLADERF_TX, &md.timestamp);
-        }
-        _txNextTicks = md.timestamp;
-    }
-
-    //end of burst
-    if ((flags & SOAPY_SDR_END_BURST) != 0)
-    {
-        md.flags |= BLADERF_META_FLAG_TX_BURST_END;
-    }
 
     //prepare buffers
     void *samples = (void *)buffs[0];
@@ -481,7 +368,7 @@ int bladeRF_SoapySDR::writeStream(
     }
 
     //send the tx samples
-    int ret = bladerf_sync_tx(_dev, samples, numElems*_txChans.size(), &md, timeoutUs/1000);
+    int ret = bladerf_sync_tx(_dev, samples, numElems*_txChans.size(), NULL, timeoutUs/1000);
     if (ret == BLADERF_ERR_TIMEOUT) return SOAPY_SDR_TIMEOUT;
     if (ret == BLADERF_ERR_TIME_PAST) return SOAPY_SDR_TIME_ERROR;
     if (ret != 0)
@@ -489,33 +376,8 @@ int bladeRF_SoapySDR::writeStream(
         SoapySDR::logf(SOAPY_SDR_ERROR, "bladerf_sync_tx() returned %s", _err2str(ret).c_str());
         return SOAPY_SDR_STREAM_ERROR;
     }
-    _txNextTicks += numElems;
-
-    //always in a burst after successful tx
-    _inTxBurst = true;
-
-    //parse the status
-    if ((md.status & BLADERF_META_STATUS_UNDERRUN) != 0)
-    {
-        SoapySDR::log(SOAPY_SDR_SSI, "U");
-        StreamMetadata resp;
-        resp.flags = 0;
-        resp.code = SOAPY_SDR_UNDERFLOW;
-        _txResps.push(resp);
-    }
-
-    //end burst status message
-    if ((flags & SOAPY_SDR_END_BURST) != 0)
-    {
-        StreamMetadata resp;
-        resp.flags = SOAPY_SDR_END_BURST | SOAPY_SDR_HAS_TIME;
-        resp.timeNs = this->_txTicksToTimeNs(_txNextTicks);
-        resp.code = 0;
-        _txResps.push(resp);
-        _inTxBurst = false;
-    }
-
-    return numElems;
+    
+   return numElems;
 }
 
 int bladeRF_SoapySDR::readStreamStatus(
